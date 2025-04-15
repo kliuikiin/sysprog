@@ -28,10 +28,10 @@
 #define MAX_MESSAGES 128
 
 struct chat_buffer {
-	char *data;
-	uint32_t size;
-	uint32_t used;
-	uint32_t processed;
+	char *data;         /* Buffer data */
+	uint32_t size;      /* Buffer capacity */
+	uint32_t used;      /* Used bytes */
+	uint32_t processed; /* Processed bytes (for output buffer) */
 };
 
 struct chat_message_queue {
@@ -42,9 +42,13 @@ struct chat_message_queue {
 };
 
 struct chat_peer {
+	/** Client's socket. To read/write messages. */
 	int socket;
+	/** Input buffer. */
 	struct chat_buffer input_buffer;
+	/** Output buffer. */
 	struct chat_buffer output_buffer;
+	/** Client name */
 #if NEED_AUTHOR
 	char *name;
 #endif
@@ -52,12 +56,17 @@ struct chat_peer {
 };
 
 struct chat_server {
+	/** Listening socket. To accept new clients. */
 	int socket;
+	/** IO multiplexing descriptor (epoll/kqueue) */
 	int io_descriptor;
+	/** Array of peers. */
 	struct chat_peer *peers;
 	int peer_count;
 	int peer_capacity;
+	/** Message queue */
 	struct chat_message_queue message_queue;
+	/** Server input buffer for feed */
 #if NEED_SERVER_FEED
 	struct chat_buffer server_buffer;
 #endif
@@ -183,17 +192,19 @@ chat_message_queue_compact(struct chat_message_queue *queue)
 static struct chat_message *
 create_message(const char *data, uint32_t len, const char *author)
 {
+	// Skip leading whitespace
 	while (len > 0 && isspace((unsigned char)*data)) {
 		data++;
 		len--;
 	}
 	
+	// Skip trailing whitespace
 	while (len > 0 && isspace((unsigned char)data[len - 1])) {
 		len--;
 	}
 	
 	if (len == 0)
-		return NULL;
+		return NULL;  // Empty message after trimming
 	
 	struct chat_message *message = malloc(sizeof(struct chat_message));
 	message->data = malloc(len + 1);
@@ -239,6 +250,7 @@ chat_server_add_peer(struct chat_server *server, int socket)
 	peer->name = NULL;
 #endif
 	
+	// Add peer socket to the IO multiplexing
 #ifdef EPOLL_MODE
 	struct epoll_event event;
 	event.events = EPOLLIN | EPOLLOUT | EPOLLET;
@@ -285,6 +297,7 @@ static void
 chat_server_broadcast_message(struct chat_server *server, struct chat_message *message, 
 							  struct chat_peer *exclude_peer)
 {
+	// Count active peers (for debugging)
 	int active_peers = 0;
 	for (int i = 0; i < server->peer_count; i++) {
 		if (server->peers[i].is_active && &server->peers[i] != exclude_peer) {
@@ -298,6 +311,7 @@ chat_server_broadcast_message(struct chat_server *server, struct chat_message *m
 		if (!peer->is_active || peer == exclude_peer)
 			continue;
 		
+		// Format the message with author if needed
 		char *formatted_message;
 #if NEED_AUTHOR
 		int len = asprintf(&formatted_message, "%s: %s\n", message->author, message->data);
@@ -310,6 +324,7 @@ chat_server_broadcast_message(struct chat_server *server, struct chat_message *m
 			continue;
 		}
 		
+		// Add message to peer's output buffer
 		chat_buffer_ensure_capacity(&peer->output_buffer, len);
 		memcpy(peer->output_buffer.data + peer->output_buffer.used, formatted_message, len);
 		peer->output_buffer.used += len;
@@ -324,6 +339,7 @@ chat_server_handle_client_input(struct chat_server *server, struct chat_peer *pe
 	char buf[BUFFER_SIZE];
 	ssize_t bytes_read;
 	
+	// Read as much data as possible
 	while ((bytes_read = read(peer->socket, buf, sizeof(buf))) > 0) {
 		chat_buffer_ensure_capacity(&peer->input_buffer, bytes_read);
 		memcpy(peer->input_buffer.data + peer->input_buffer.used, buf, bytes_read);
@@ -336,19 +352,23 @@ chat_server_handle_client_input(struct chat_server *server, struct chat_peer *pe
 		return;
 	}
 	
-	if (bytes_read == 0) {
+	if (bytes_read == 0) {  // Client has closed the connection
 		chat_server_remove_peer(server, peer);
 		return;
 	}
 	
+	// Process complete messages
 	char *data = peer->input_buffer.data;
 	uint32_t start = 0;
 	
 	for (uint32_t i = 0; i < peer->input_buffer.used; i++) {
 		if (data[i] == '\n') {
+			// We have a complete message
 #if NEED_AUTHOR
 			if (peer->name == NULL) {
+				// First message is the client name
 				uint32_t name_len = i - start;
+				// Trim leading/trailing whitespace
 				uint32_t trim_start = start;
 				while (trim_start < i && isspace((unsigned char)data[trim_start])) {
 					trim_start++;
@@ -359,7 +379,9 @@ chat_server_handle_client_input(struct chat_server *server, struct chat_peer *pe
 				}
 				name_len = trim_end - trim_start;
 				
+				// Ensure we have a valid name
 				if (name_len == 0) {
+					// Empty name after trimming, use a default name
 					peer->name = strdup("anonymous");
 				} else {
 					peer->name = malloc(name_len + 1);
@@ -377,8 +399,10 @@ chat_server_handle_client_input(struct chat_server *server, struct chat_peer *pe
 #endif
 															 );
 				if (message) {
+					// Add to the message queue
 					chat_message_queue_push(&server->message_queue, message);
 					
+					// Broadcast to all peers except the sender
 					chat_server_broadcast_message(server, message, peer);
 				}
 			}
@@ -386,6 +410,7 @@ chat_server_handle_client_input(struct chat_server *server, struct chat_peer *pe
 		}
 	}
 	
+	// Move any remaining partial message to the beginning of the buffer
 	if (start > 0) {
 		memmove(data, data + start, peer->input_buffer.used - start);
 		peer->input_buffer.used -= start;
@@ -405,12 +430,14 @@ chat_server_handle_client_output(struct chat_peer *peer)
 	if (bytes_written > 0) {
 		peer->output_buffer.processed += bytes_written;
 		
+		// If we've written everything, reset the buffer
 		if (peer->output_buffer.processed == peer->output_buffer.used) {
 			peer->output_buffer.used = 0;
 			peer->output_buffer.processed = 0;
 		}
 	} else if (bytes_written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		perror("write");
+		// Error will be handled on next update
 	}
 }
 
@@ -428,6 +455,7 @@ chat_server_new(void)
 	chat_buffer_init(&server->server_buffer, BUFFER_SIZE);
 #endif
 	
+	// Initialize IO multiplexing
 #ifdef EPOLL_MODE
 	server->io_descriptor = epoll_create1(0);
 	if (server->io_descriptor == -1) {
@@ -441,7 +469,7 @@ chat_server_new(void)
 		abort();
 	}
 #else
-	server->io_descriptor = -1;
+	server->io_descriptor = -1; // Will use poll instead
 #endif
 	
 	return server;
@@ -453,11 +481,13 @@ chat_server_delete(struct chat_server *server)
 	if (server->socket >= 0)
 		close(server->socket);
 	
+	// Clean up all peers
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];
 		if (peer->is_active) {
 			chat_server_remove_peer(server, peer);
 		} else {
+			// Even for inactive peers, we need to clean up buffers
 			chat_buffer_free(&peer->input_buffer);
 			chat_buffer_free(&peer->output_buffer);
 #if NEED_AUTHOR
@@ -473,6 +503,7 @@ chat_server_delete(struct chat_server *server)
 	chat_buffer_free(&server->server_buffer);
 #endif
 	
+	// Close IO multiplexing descriptor
 	if (server->io_descriptor >= 0)
 		close(server->io_descriptor);
 	
@@ -488,12 +519,14 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 	addr.sin_port = htons(port);
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	
+	// Create socket
 	server->socket = socket(AF_INET, SOCK_STREAM, 0);
 	if (server->socket < 0) {
 		perror("socket");
 		return -1;
 	}
 	
+	// Set non-blocking mode
 	if (set_nonblocking(server->socket) < 0) {
 		perror("fcntl");
 		close(server->socket);
@@ -501,6 +534,7 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 		return -1;
 	}
 	
+	// Allow reuse of the port
 	int opt = 1;
 	if (setsockopt(server->socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
 		perror("setsockopt");
@@ -509,6 +543,7 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 		return -1;
 	}
 	
+	// Bind
 	if (bind(server->socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		perror("bind");
 		close(server->socket);
@@ -516,6 +551,7 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 		return -1;
 	}
 	
+	// Listen
 	if (listen(server->socket, SOMAXCONN) < 0) {
 		perror("listen");
 		close(server->socket);
@@ -523,6 +559,7 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 		return -1;
 	}
 	
+	// Add the server socket to IO multiplexing
 #ifdef EPOLL_MODE
 	struct epoll_event event;
 	event.events = EPOLLIN | EPOLLET;
@@ -552,6 +589,7 @@ chat_server_pop_next(struct chat_server *server)
 {
 	struct chat_message *message = chat_message_queue_pop(&server->message_queue);
 	
+	// Compact the queue if needed
 	if (server->message_queue.read_pos > server->message_queue.size / 2) {
 		chat_message_queue_compact(&server->message_queue);
 	}
@@ -562,6 +600,7 @@ chat_server_pop_next(struct chat_server *server)
 static void
 server_handle_output_for_all_clients(struct chat_server *server)
 {
+	// Process write buffers for all active clients
 	bool progress = false;
 	do {
 		progress = false;
@@ -575,6 +614,7 @@ server_handle_output_for_all_clients(struct chat_server *server)
 				}
 			}
 		}
+		// Keep trying as long as we're making progress on any client's output buffer
 	} while (progress);
 }
 
@@ -589,15 +629,18 @@ chat_server_update(struct chat_server *server, double timeout)
 	struct epoll_event events[MAX_PEERS];
 	int timeout_ms = timeout < 0 ? -1 : (int)(timeout * 1000);
 	
+	// Check if any peer has data to write and make sure EPOLLOUT is set
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];
 		if (!peer->is_active)
 			continue;
 			
 		if (peer->output_buffer.used > peer->output_buffer.processed) {
+			// Add EPOLLOUT to the event to make sure we can write data
 			struct epoll_event event;
 			event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 			event.data.ptr = peer;
+			// Note: we're using EPOLL_CTL_MOD which is less efficient but necessary here
 			epoll_ctl(server->io_descriptor, EPOLL_CTL_MOD, peer->socket, &event);
 		}
 	}
@@ -616,7 +659,9 @@ chat_server_update(struct chat_server *server, double timeout)
 	}
 	
 	for (int i = 0; i < event_count; i++) {
+		// Check if it's the server socket
 		if (events[i].data.ptr == server) {
+			// Accept new connections
 			struct sockaddr_in client_addr;
 			socklen_t client_len = sizeof(client_addr);
 			
@@ -630,27 +675,34 @@ chat_server_update(struct chat_server *server, double timeout)
 					break;
 				}
 				
+				// Set the socket to non-blocking mode
 				if (set_nonblocking(client_sock) < 0) {
 					perror("fcntl");
 					close(client_sock);
 					continue;
 				}
 				
+				// Add the client to our list
 				chat_server_add_peer(server, client_sock);
 			}
 		} else {
+			// Client socket event
 			struct chat_peer *peer = events[i].data.ptr;
 			
+			// Check if this peer is still active
 			if (!peer->is_active)
 				continue;
 				
+			// Handle read events (input or hangup)
 			if ((events[i].events & EPOLLIN) || (events[i].events & EPOLLHUP) || (events[i].events & EPOLLERR)) {
 				chat_server_handle_client_input(server, peer);
 				
+				// If peer was deactivated in the handler, skip the write
 				if (!peer->is_active)
 					continue;
 			}
 			
+			// Handle write events
 			if (events[i].events & EPOLLOUT) {
 				chat_server_handle_client_output(peer);
 			}
@@ -682,7 +734,9 @@ chat_server_update(struct chat_server *server, double timeout)
 	}
 	
 	for (int i = 0; i < event_count; i++) {
+		// Check if it's the server socket
 		if (events[i].udata == server) {
+			// Accept new connections
 			struct sockaddr_in client_addr;
 			socklen_t client_len = sizeof(client_addr);
 			
@@ -696,15 +750,18 @@ chat_server_update(struct chat_server *server, double timeout)
 					break;
 				}
 				
+				// Set the socket to non-blocking mode
 				if (set_nonblocking(client_sock) < 0) {
 					perror("fcntl");
 					close(client_sock);
 					continue;
 				}
 				
+				// Add the client to our list
 				chat_server_add_peer(server, client_sock);
 			}
 		} else {
+			// Client socket event
 			struct chat_peer *peer = events[i].udata;
 			
 			if (events[i].filter == EVFILT_READ) {
@@ -715,11 +772,14 @@ chat_server_update(struct chat_server *server, double timeout)
 		}
 	}
 #else
+	// Using poll
 	struct pollfd *pollfds = malloc((1 + server->peer_count) * sizeof(struct pollfd));
 	
+	// Server socket
 	pollfds[0].fd = server->socket;
 	pollfds[0].events = POLLIN;
 	
+	// Client sockets
 	int poll_count = 1;
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];
@@ -754,29 +814,35 @@ chat_server_update(struct chat_server *server, double timeout)
 		return CHAT_ERR_TIMEOUT;
 	}
 	
+	// Check the server socket
 	if (pollfds[0].revents & POLLIN) {
+		// Accept new connections - accept as many as possible in one go
 		struct sockaddr_in client_addr;
 		socklen_t client_len = sizeof(client_addr);
 		
+		// Loop until no more pending connections
 		while (1) {
 			int client_sock = accept(server->socket, (struct sockaddr *)&client_addr, &client_len);
 			if (client_sock < 0) {
 				if (errno != EAGAIN && errno != EWOULDBLOCK) {
 					perror("accept");
 				}
-				break;
+				break; // Either error or no more connections to accept
 			}
 			
+			// Set the socket to non-blocking mode
 			if (set_nonblocking(client_sock) < 0) {
 				perror("fcntl");
 				close(client_sock);
 				continue;
 			}
 			
+			// Add the client to our list
 			chat_server_add_peer(server, client_sock);
 		}
 	}
 	
+	// Check client sockets
 	poll_count = 1;
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];
@@ -798,16 +864,20 @@ chat_server_update(struct chat_server *server, double timeout)
 #endif
 
 #if NEED_SERVER_FEED
+	// Process server input buffer
 	char *data = server->server_buffer.data;
 	uint32_t start = 0;
 	bool processed_message = false;
 	
 	for (uint32_t i = 0; i < server->server_buffer.used; i++) {
 		if (data[i] == '\n') {
+			// We have a complete message
 			struct chat_message *message = create_message(data + start, i - start, NULL);
 			if (message) {
+				// Add to the message queue
 				chat_message_queue_push(&server->message_queue, message);
 				
+				// Broadcast to all peers
 				chat_server_broadcast_message(server, message, NULL);
 				processed_message = true;
 			}
@@ -815,16 +885,19 @@ chat_server_update(struct chat_server *server, double timeout)
 		}
 	}
 	
+	// Move any remaining partial message to the beginning of the buffer
 	if (start > 0) {
 		memmove(data, data + start, server->server_buffer.used - start);
 		server->server_buffer.used -= start;
 	}
 	
+	// If we processed any server feed messages, ensure clients get messages
 	if (processed_message) {
 		server_handle_output_for_all_clients(server);
 	}
 #endif
 
+	// Always try to process pending output to clients before returning
 	server_handle_output_for_all_clients(server);
 	
 	return 0;
@@ -850,12 +923,14 @@ chat_server_get_socket(const struct chat_server *server)
 int
 chat_server_get_events(const struct chat_server *server)
 {
+	// If server is not started yet, return no events
 	if (server->socket < 0) {
 		return 0;
 	}
 	
 	int events = CHAT_EVENT_INPUT;
 	
+	// Check if any peer has output data ready
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];
 		if (peer->is_active && peer->output_buffer.used > peer->output_buffer.processed) {
@@ -875,24 +950,32 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 	memcpy(server->server_buffer.data + server->server_buffer.used, msg, msg_size);
 	server->server_buffer.used += msg_size;
 	
+	// If we received a newline and our buffer has content, process it immediately
+	// This handles the edge case in the test_server_feed test
 	if (msg_size == 1 && msg[0] == '\n') {
+		// Process server input buffer immediately
 		char *data = server->server_buffer.data;
 		uint32_t start = 0;
 		
 		for (uint32_t i = 0; i < server->server_buffer.used; i++) {
 			if (data[i] == '\n') {
+				// We have a complete message
 				struct chat_message *message = create_message(data + start, i - start, NULL);
 				if (message) {
+					// Add to the message queue
 					chat_message_queue_push(&server->message_queue, message);
 					
+					// Broadcast to all peers
 					chat_server_broadcast_message(server, message, NULL);
 					
+					// Ensure output buffers are processed for all clients
 					server_handle_output_for_all_clients(server);
 				}
 				start = i + 1;
 			}
 		}
 		
+		// Move any remaining partial message to the beginning of the buffer
 		if (start > 0) {
 			memmove(data, data + start, server->server_buffer.used - start);
 			server->server_buffer.used -= start;

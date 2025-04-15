@@ -17,10 +17,10 @@
 #define MAX_MESSAGES 128
 
 struct chat_buffer {
-	char *data;
-	uint32_t size;
-	uint32_t used;
-	uint32_t processed;
+	char *data;         /* Buffer data */
+	uint32_t size;      /* Buffer capacity */
+	uint32_t used;      /* Used bytes */
+	uint32_t processed; /* Processed bytes (for output buffer) */
 };
 
 struct chat_message_queue {
@@ -31,13 +31,19 @@ struct chat_message_queue {
 };
 
 struct chat_client {
+	/** Socket connected to the server. */
 	int socket;
+	/** Input buffer from server. */
 	struct chat_buffer input_buffer;
+	/** Output buffer to server. */
 	struct chat_buffer output_buffer;
+	/** Message queue for received messages. */
 	struct chat_message_queue message_queue;
+	/** Client name */
 #if NEED_AUTHOR
 	char *name;
 #endif
+	/** Whether we have sent our name to the server */
 	bool name_sent;
 };
 
@@ -170,17 +176,19 @@ chat_message_queue_compact(struct chat_message_queue *queue)
 static struct chat_message *
 create_message(const char *data, uint32_t len, const char *author)
 {
+	// Skip leading whitespace
 	while (len > 0 && isspace((unsigned char)*data)) {
 		data++;
 		len--;
 	}
 	
+	// Skip trailing whitespace
 	while (len > 0 && isspace((unsigned char)data[len - 1])) {
 		len--;
 	}
 	
 	if (len == 0)
-		return NULL;
+		return NULL;  // Empty message after trimming
 	
 	struct chat_message *message = malloc(sizeof(struct chat_message));
 	message->data = malloc(len + 1);
@@ -204,6 +212,7 @@ chat_client_handle_server_input(struct chat_client *client)
 	char buf[BUFFER_SIZE];
 	ssize_t bytes_read;
 	
+	// Read as much data as possible
 	while ((bytes_read = read(client->socket, buf, sizeof(buf))) > 0) {
 		chat_buffer_ensure_capacity(&client->input_buffer, bytes_read);
 		memcpy(client->input_buffer.data + client->input_buffer.used, buf, bytes_read);
@@ -212,24 +221,28 @@ chat_client_handle_server_input(struct chat_client *client)
 	
 	if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		perror("read from server");
+		// Error will be handled on next update
 		return;
 	}
 	
-	if (bytes_read == 0) {
+	if (bytes_read == 0) {  // Server has closed the connection
 		close(client->socket);
 		client->socket = -1;
 		return;
 	}
 	
+	// Process complete messages
 	char *data = client->input_buffer.data;
 	uint32_t start = 0;
 	
 	for (uint32_t i = 0; i < client->input_buffer.used; i++) {
 		if (data[i] == '\n') {
+			// Extract author and message
 			char *msg_start = data + start;
 			uint32_t msg_len = i - start;
 			
 #if NEED_AUTHOR
+			// Format is "author: message"
 			char *colon = memchr(msg_start, ':', msg_len);
 			if (colon) {
 				uint32_t author_len = colon - msg_start;
@@ -237,13 +250,16 @@ chat_client_handle_server_input(struct chat_client *client)
 				memcpy(author, msg_start, author_len);
 				author[author_len] = '\0';
 				
+				// Trim whitespace from author
 				char *author_end = author + author_len - 1;
 				while (author_end > author && isspace((unsigned char)*author_end))
 					*author_end-- = '\0';
 				
+				// Skip colon and possible space
 				msg_start = colon + 1;
 				msg_len = i - (msg_start - data);
 				
+				// Trim leading whitespace from message
 				while (msg_len > 0 && isspace((unsigned char)*msg_start)) {
 					msg_start++;
 					msg_len--;
@@ -256,6 +272,7 @@ chat_client_handle_server_input(struct chat_client *client)
 				
 				free(author);
 			} else {
+				// No author separator, use the whole message
 				struct chat_message *message = create_message(msg_start, msg_len, "");
 				if (message) {
 					chat_message_queue_push(&client->message_queue, message);
@@ -272,6 +289,7 @@ chat_client_handle_server_input(struct chat_client *client)
 		}
 	}
 	
+	// Move any remaining partial message to the beginning of the buffer
 	if (start > 0) {
 		memmove(data, data + start, client->input_buffer.used - start);
 		client->input_buffer.used -= start;
@@ -291,12 +309,14 @@ chat_client_handle_output(struct chat_client *client)
 	if (bytes_written > 0) {
 		client->output_buffer.processed += bytes_written;
 		
+		// If we've written everything, reset the buffer
 		if (client->output_buffer.processed == client->output_buffer.used) {
 			client->output_buffer.used = 0;
 			client->output_buffer.processed = 0;
 		}
 	} else if (bytes_written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		perror("write to server");
+		// Error will be handled on next update
 	}
 }
 
@@ -344,6 +364,7 @@ chat_client_connect(struct chat_client *client, const char *addr)
 	char host[256];
 	char *port_str;
 	
+	// Parse host:port
 	strncpy(host, addr, sizeof(host) - 1);
 	host[sizeof(host) - 1] = '\0';
 	
@@ -355,6 +376,7 @@ chat_client_connect(struct chat_client *client, const char *addr)
 	*port_str = '\0';
 	port_str++;
 	
+	// Get address info
 	struct addrinfo hints;
 	struct addrinfo *result, *rp;
 	
@@ -368,11 +390,13 @@ chat_client_connect(struct chat_client *client, const char *addr)
 		return -1;
 	}
 	
+	// Try each address until we successfully connect
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
 		client->socket = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if (client->socket == -1)
 			continue;
 		
+		// Set non-blocking mode
 		if (set_nonblocking(client->socket) < 0) {
 			close(client->socket);
 			client->socket = -1;
@@ -380,7 +404,7 @@ chat_client_connect(struct chat_client *client, const char *addr)
 		}
 		
 		if (connect(client->socket, rp->ai_addr, rp->ai_addrlen) == 0 || errno == EINPROGRESS) {
-			break;
+			break; // Success or in progress
 		}
 		
 		close(client->socket);
@@ -394,6 +418,7 @@ chat_client_connect(struct chat_client *client, const char *addr)
 	}
 	
 #if NEED_AUTHOR
+	// Send the client name immediately
 	if (!client->name_sent) {
 		int name_len = strlen(client->name);
 		chat_buffer_ensure_capacity(&client->output_buffer, name_len + 1);
@@ -412,6 +437,7 @@ chat_client_pop_next(struct chat_client *client)
 {
 	struct chat_message *message = chat_message_queue_pop(&client->message_queue);
 	
+	// Compact the queue if needed
 	if (client->message_queue.read_pos > client->message_queue.size / 2) {
 		chat_message_queue_compact(&client->message_queue);
 	}
@@ -458,6 +484,7 @@ chat_client_update(struct chat_client *client, double timeout)
 	}
 	
 	if (pfd.revents & (POLLHUP | POLLERR)) {
+		// Server disconnected or error
 		close(client->socket);
 		client->socket = -1;
 		return -1;
@@ -475,6 +502,7 @@ chat_client_get_descriptor(const struct chat_client *client)
 int
 chat_client_get_events(const struct chat_client *client)
 {
+	// If client is not connected yet, return no events
 	if (client->socket < 0) {
 		return 0;
 	}
