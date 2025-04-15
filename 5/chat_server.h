@@ -1,106 +1,91 @@
-#pragma once
+#ifndef CHAT_SERVER_H
+#define CHAT_SERVER_H
 
-#include <stdint.h>
+#include "chat.h"
 
 struct chat_server;
 
 /**
- * Create a new chat server. No bind, no listen, just allocate and
- * initialize it.
+ * Create a new server.
  */
 struct chat_server *
 chat_server_new(void);
 
-/** Free all server's resources. */
+/**
+ * Delete a server.
+ */
 void
 chat_server_delete(struct chat_server *server);
 
 /**
- * Try to listen for new clients on the given port.
- *
- * @param server Chat server.
- * @param port Port to listen on.
+ * Start listening on a given port. 0 means any port, check
+ * chat_server_get_port() to find out which one was chosen.
  *
  * @retval 0 Success.
- * @retval !=0 Error code.
- *     - CHAT_ERR_PORT_BUSY - the port is already busy.
- *     - CHAT_ERR_ALREADY_STARTED - the server is already listening.
- *     - CHAT_ERR_SYS - a system error, check errno.
+ * @retval -1 Error, check errno.
  */
 int
 chat_server_listen(struct chat_server *server, uint16_t port);
 
 /**
- * Pop a next pending chat message. The returned message has to be
- * freed using chat_message_delete().
- *
- * @param server Chat server.
- *
- * @retval not-NULL A message.
- * @retval NULL No more messages yet.
- */
-struct chat_message *
-chat_server_pop_next(struct chat_server *server);
-
-/**
- * Wait for any update on any of the sockets for the given timeout
- * and do this update.
- *
- * @param server Chat server.
- * @param timeout Timeout in seconds to wait for.
- *
- * @retval 0 Success.
- * @retval !=0 Error code.
- *     - CHAT_ERR_TIMEOUT - no updates, timed out.
- *     - CHAT_ERR_NOT_STARTED - the server is not listening yet.
- *     - CHAT_ERR_SYS - a system error, check errno.
- */
-int
-chat_server_update(struct chat_server *server, double timeout);
-
-/**
- * Get server's descriptor suitable for event loops like poll/epoll/kqueue. This
- * is useful when want to embed the server into some external event loop. For
- * example, to join it with reading stdin.
- *
- * @retval >=0 A valid descriptor.
- * @retval -1 No descriptor.
- */
-int
-chat_server_get_descriptor(const struct chat_server *server);
-
-/**
- * Get the server's own socket descriptor. Not a multiplexing descriptor like
- * an epoll or kqueue one, but the original listening descriptor.
- *
- * @retval >=0 A valid descriptor.
- * @retval -1 No descriptor.
+ * Get the server's socket descriptor.
  */
 int
 chat_server_get_socket(const struct chat_server *server);
 
 /**
- * Get a mask of chat_event values wanted by the server. Needed together with
- * server's descriptor for any waiting in poll/epoll/kqueue.
- *
- * @retval !=0 Event mask to wait for.
- * @retval 0 No events.
+ * Get events supported by the server.
  */
 int
 chat_server_get_events(const struct chat_server *server);
 
 /**
- * Feed a message to the server to broadcast to all clients.
+ * Update server's state. Process incoming connections, read/write
+ * data from/to clients.
  *
- * @param server Chat server.
- * @param msg Message.
- * @param msg_size Size of the message.
+ * @param timeout Timeout in seconds to wait for updates, can be 0
+ *   to return immediately, or < 0 to wait indefinitely.
  *
- * @retval 0 Success.
- * @retval !=0 Error code.
- *     - CHAT_ERR_NOT_IMPLEMENTED - not implemented.
- *     - CHAT_ERR_NOT_STARTED - the server is not listening yet.
+ * @retval 0 Success, has updates.
+ * @retval CHAT_ERR_TIMEOUT No updates within the timeout.
+ * @retval CHAT_ERR_NOT_STARTED Server isn't started yet.
+ * @retval -1 Error, see errno.
  */
 int
-chat_server_feed(struct chat_server *server, const char *msg,
-		 uint32_t msg_size);
+chat_server_update(struct chat_server *server, double timeout);
+
+/**
+ * Get next unprocessed message from a client. Messages are queued
+ * when they are received from clients in chat_server_update().
+ *
+ * @retval not NULL Success, a new message.
+ * @retval NULL No new messages.
+ */
+struct chat_message *
+chat_server_pop_next(struct chat_server *server);
+
+/**
+ * Get server descriptor for using in the select() function. This
+ * descriptor becomes active on input when there are messages
+ * from its socket or its clients. For a simple file descriptor
+ * for using in poll() just use chat_server_get_socket().
+ *
+ * @retval >= 0 The descriptor.
+ * @retval -1 Not implemented.
+ */
+int
+chat_server_get_descriptor(const struct chat_server *server);
+
+/**
+ * Feed a message from server to all connected clients.
+ *
+ * @param msg Message text.
+ * @param msg_size Message text size.
+ *
+ * @retval 0 Success.
+ * @retval CHAT_ERR_NOT_IMPLEMENTED Not implemented.
+ */
+int
+chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size);
+
+#endif /* CHAT_SERVER_H */
