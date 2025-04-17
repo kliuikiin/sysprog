@@ -1,0 +1,104 @@
+------------------------------------------------------------------
+Coroutine messaging system
+Language: С.
+Deadline: 2 weeks.
+------------------------------------------------------------------
+
+There is a messaging object called bus, like on a motherboard. The
+bus allows to open channels which can be used for sending trivial
+messages.
+
+Need to implement this bus messaging object with coroutine
+support.
+
+Coroutine, also known as a co-program, a light thread, a virtual
+thread, a green thread, a fiber, is a unit of the program flow.
+It runs linear code and has a stack, same as a regular thread, but
+it can't be scheduled by the kernel. Instead, the coroutines are
+user space objects, and they are scheduled entirely by the user
+space. The simplest setup is when one thread has many coroutines
+inside and can run them in turns.
+
+The coroutines themselves are already implemented, and the bus'
+idea is very simple. The main challenge is to make the bus
+compatible with these coroutines.
+
+For instance, the bus channel has a size limit. When a coroutine
+tries to send a message into the channel and the size limit is
+reached, the coroutine must be suspended until there is space in
+the channel.
+
+The tests are in test.c. The implementation template is in
+corobus.h and corobus.c.
+
+
+Rules:
+
+- Need to strictly follow the behaviour of each function explained
+  in corobus.h comments.
+
+- The provided tests must all pass.
+
+- The code should be built successfully with these compiler flags:
+  `-Wextra -Werror -Wall -Wno-gnu-folding-constant`.
+
+
+Restrictions:
+
+- Global variables are not allowed (except for the already
+  existing ones).
+
+- Memory leaks are not allowed. To check them you can use
+  utils/heap_help tool. Showing zero leak reports from Valgrind or
+  ASAN is not enough - they often miss the leaks.
+
+- Can not change test.c, libcoro.c, libcoro.h.
+
+
+Relaxations:
+
+- You can assume, that malloc()/realloc()/calloc() never fail.
+
+- Use can use intrusive list container defined in utils/rlist.h.
+
+
+Advices:
+
+- Try to inspect the libcoro_test.c and test.c to see how the
+  coroutines are used. Try to run libcoro_test.c, add some prints,
+  use a debugger, to see how what works.
+
+- Read libcoro.h to see what kind of API you have available. See
+  what could be used in your solutions for which things.
+
+- Once you understand the libcoro coroutines, try to design your
+  solution. In your head at first, then write it down as text. Do
+  not start coding until you know what to code. Think first, code
+  second.
+
+- Implement firstly 'try_send', 'try_recv', and others 'try'. They
+  do not block the current coroutine, which makes them quite
+  trivial. Then try to implement 'send' via 'try_send', 'recv' via
+  'try_recv', and so on.
+
+
+Possible solutions:
+
+- 15 points: pass all the basic tests.
+
+- +5 points: implement 'broadcast'. To enable broadcast tests you
+  should define the macro NEED_BROADCAST to 1 in corobus.h. The
+  tests must pass. Refer to corobus.h header to see what the
+  broadcast functions should be doing.
+
+- +5 points: batch send/recv. To enable the corresponding tests
+  you should define the macro NEED_BATCH to 1 in corobus.h. The
+  tests must pass. Refer to corobus.h header to see what the batch
+  functions should be doing.
+
+- -5 points: (yes, minus, not plus) - you can use C++ and STL
+  containers.
+
+The additional options for +5 points do not include each other.
+That is, you can do none, or do only one, or do only another, or
+both for +10. Or use C++ and get -5 to your sum.
