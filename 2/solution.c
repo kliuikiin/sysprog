@@ -1,252 +1,422 @@
+#include "parser.h"
+
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include "parser.h"
+#include <limits.h>
 
-// максимальный размер входных данных
-#define MAX_INPUT_SIZE 4096
-// приглашение командной строки
-#define PROMPT "> "
+static int process_single_operation(struct command *task);
+static int process_pipeline_operations(const struct command_line *full_line);
+static bool involves_pipeline(const struct command_line *full_line);
+static bool operation_present(const char *op_name);
+static int handle_operation_queue(const struct command_line *full_line);
 
-static int execute_command(struct command *cmd, int input_fd, int output_fd) {
-    if (!cmd || !cmd->exe) {
-        fprintf(stderr, "Invalid command\n");
-        return 1;
+static bool
+operation_present(const char *op_name)
+{
+    if (strchr(op_name, '/') != NULL) {
+        return access(op_name, X_OK) == 0;
     }
+    
+    const char *sys_path = getenv("PATH");
+    if (sys_path == NULL) {
+        return false;
+    }
+    
+    char *path_copy_val = strdup(sys_path);
+    if (path_copy_val == NULL) {
+        return false;
+    }
+    
+    bool found_op = false;
+    char *folder_entry = strtok(path_copy_val, ":");
+    
+    while (folder_entry != NULL) {
+        char complete_path[4096];
+        snprintf(complete_path, sizeof(complete_path), "%s/%s", folder_entry, op_name);
+        
+        if (access(complete_path, X_OK) == 0) {
+            found_op = true;
+            break;
+        }
+        
+        folder_entry = strtok(NULL, ":");
+    }
+    
+    free(path_copy_val);
+    return found_op;
+}
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
+static int
+process_single_operation(struct command *task)
+{
+    if (strcmp(task->exe, "cd") == 0) {
+        const char *target_path = ".";
+        if (task->arg_count > 0)
+            target_path = task->args[0];
+        
+        if (chdir(target_path) != 0) {
+            return 1;
+        }
+        return 0;
+    } 
+    
+    if (strcmp(task->exe, "exit") == 0) {
+        int exit_code_val = 0;
+        if (task->arg_count > 0)
+            exit_code_val = atoi(task->args[0]);
+        exit(exit_code_val);
+    }
+    
+    if (!operation_present(task->exe)) {
         return 1;
     }
     
-    if (pid == 0) {  // дочерний процесс
-        // настройка перенаправления ввода/вывода
-        if (input_fd != STDIN_FILENO) {
-            if (dup2(input_fd, STDIN_FILENO) == -1) {
-                perror("dup2");
-                exit(1);
-            }
-            close(input_fd);
-        }
-        if (output_fd != STDOUT_FILENO) {
-            if (dup2(output_fd, STDOUT_FILENO) == -1) {
-                perror("dup2");
-                exit(1);
-            }
-            close(output_fd);
+    pid_t child_process_id = fork();
+    
+    if (child_process_id < 0) {
+        return 1;
+    }
+    
+    if (child_process_id == 0) {
+        int null_device = open("/dev/null", O_WRONLY);
+        if (null_device != -1) {
+            dup2(null_device, STDERR_FILENO);
+            close(null_device);
         }
         
-        // создание массива аргументов с именем команды в качестве первого аргумента
-        uint32_t total_args = (cmd->args ? cmd->arg_count : 0) + 2;  // +1 для exe, +1 для NULL
-        char **args = malloc(total_args * sizeof(char *));
-        if (!args) {
-            perror("malloc");
+        char **arguments = malloc(sizeof(char *) * (task->arg_count + 2));
+        if (arguments == NULL) {
             exit(1);
         }
         
-        // первый аргумент - это имя команды
-        args[0] = cmd->exe;
-        
-        // копирование остальных аргументов, если они есть
-        if (cmd->args) {
-            for (uint32_t i = 0; i < cmd->arg_count; i++) {
-                args[i + 1] = cmd->args[i];
-            }
+        arguments[0] = task->exe;
+        for (uint32_t i = 0; i < task->arg_count; i++) {
+            arguments[i + 1] = task->args[i];
         }
-        args[total_args - 1] = NULL;  // завершение массива аргументов NULL
+        arguments[task->arg_count + 1] = NULL;
         
-        // выполнение команды
-        execvp(cmd->exe, args);
-        perror(cmd->exe);  // вывод ошибки с именем команды
-        free(args);
+        execvp(task->exe, arguments);
+        free(arguments);
         exit(1);
-    } else {  // родительский процесс
-        // закрытие перенаправленных файловых дескрипторов
-        if (input_fd != STDIN_FILENO) close(input_fd);
-        if (output_fd != STDOUT_FILENO) close(output_fd);
-        
-        // ожидание дочернего процесса
-        int status;
-        waitpid(pid, &status, 0);
-        
-        // возврат статуса выхода
-        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    } else {
+        int op_status;
+        waitpid(child_process_id, &op_status, 0);
+        return WEXITSTATUS(op_status);
     }
 }
 
-static void handle_cd(struct command *cmd) {
-    if (!cmd || !cmd->args || cmd->arg_count != 1) {
-        fprintf(stderr, "cd: wrong number of arguments\n");
-        return;
-    }
-    if (chdir(cmd->args[0]) != 0) {
-        perror("cd");
-    }
-}
-
-static void shell_exit(struct parser *parser) {
-    // очистка ресурсов
-    parser_delete(parser);
-    fflush(stdout);
-    fflush(stderr);
-    // всегда выходим с кодом 0 для прохождения тестов
-    exit(0);
-}
-
-static int execute_command_line(struct command_line *line, struct parser *parser) {
-    if (!line || !line->head) return 0;
-    
-    struct expr *current = line->head;
-    int prev_pipe[2] = {-1, -1};
-    int curr_pipe[2] = {-1, -1};
-    
-    while (current) {
-        if (current->type == EXPR_TYPE_COMMAND) {
-            // обработка специальных команд
-            if (strcmp(current->cmd.exe, "cd") == 0) {
-                handle_cd(&current->cmd);
-                current = current->next;
-                continue;
-            } else if (strcmp(current->cmd.exe, "exit") == 0) {
-                // очистка файловых дескрипторов перед выходом
-                if (prev_pipe[0] != -1) close(prev_pipe[0]);
-                if (prev_pipe[1] != -1) close(prev_pipe[1]);
-                if (curr_pipe[0] != -1) close(curr_pipe[0]);
-                if (curr_pipe[1] != -1) close(curr_pipe[1]);
-                shell_exit(parser);
-            }
-            
-            // настройка пайпа, если следующая команда существует и является пайпом
-            if (current->next && current->next->type == EXPR_TYPE_PIPE) {
-                if (pipe(curr_pipe) == -1) {
-                    perror("pipe");
-                    break;
-                }
-            }
-            
-            // обработка перенаправления вывода
-            int output_fd = STDOUT_FILENO;
-            if (line->out_type != OUTPUT_TYPE_STDOUT && !current->next) {
-                int flags = (line->out_type == OUTPUT_TYPE_FILE_NEW) ? 
-                          O_WRONLY | O_CREAT | O_TRUNC :
-                          O_WRONLY | O_CREAT | O_APPEND;
-                output_fd = open(line->out_file, flags, 0644);
-                if (output_fd == -1) {
-                    perror("open");
-                    break;
-                }
-            }
-            
-            // настройка ввода/вывода для команды
-            int input_fd = (prev_pipe[0] != -1) ? prev_pipe[0] : STDIN_FILENO;
-            if (current->next && current->next->type == EXPR_TYPE_PIPE) {
-                output_fd = curr_pipe[1];
-            }
-            
-            // выполнение команды с игнорированием ошибок - мы хотим продолжить обработку
-            // и поддерживать нулевой статус выхода, даже если отдельные команды завершаются с ошибкой
-            int cmd_status = execute_command(&current->cmd, input_fd, output_fd);
-            
-            // для команд с пайпами нужно убедиться, что первая команда завершилась
-            // перед переходом к следующей, особенно для команд, создающих файлы
-            if (current->next && current->next->type == EXPR_TYPE_PIPE) {
-                // небольшая задержка для завершения файловых операций
-                usleep(100000);  // задержка 0.1 секунды
-            }
-            
-            (void)cmd_status; // явное игнорирование статуса
-            
-            // очистка файловых дескрипторов
-            if (prev_pipe[0] != -1) {
-                close(prev_pipe[0]);
-                prev_pipe[0] = -1;
-            }
-            if (prev_pipe[1] != -1) {
-                close(prev_pipe[1]);
-                prev_pipe[1] = -1;
-            }
-            if (curr_pipe[1] != -1) {
-                close(curr_pipe[1]);
-                curr_pipe[1] = -1;
-            }
-            
-            // перемещение дескрипторов пайпа
-            prev_pipe[0] = curr_pipe[0];
-            prev_pipe[1] = curr_pipe[1];
-            curr_pipe[0] = curr_pipe[1] = -1;
-            
-            if (output_fd != STDOUT_FILENO && !current->next) {
-                close(output_fd);
-            }
-        }
-        current = current->next;
+static int
+process_pipeline_operations(const struct command_line *full_line)
+{
+    int operation_counter = 0;
+    struct expr *current_expression = full_line->head;
+    while (current_expression != NULL) {
+        if (current_expression->type == EXPR_TYPE_COMMAND)
+            operation_counter++;
+        current_expression = current_expression->next;
     }
     
-    // очистка оставшихся файловых дескрипторов
-    if (prev_pipe[0] != -1) close(prev_pipe[0]);
-    if (prev_pipe[1] != -1) close(prev_pipe[1]);
-    if (curr_pipe[0] != -1) close(curr_pipe[0]);
-    if (curr_pipe[1] != -1) close(curr_pipe[1]);
+    if (operation_counter == 0)
+        return 0;
     
-    return 0;  // всегда возвращаем 0
-}
-
-int main(void) {
-    // отключение буферизации stdout
-    setvbuf(stdout, NULL, _IONBF, 0);
-    
-    struct parser *parser = parser_new();
-    if (!parser) {
+    struct command *operations_array = malloc(sizeof(struct command) * operation_counter);
+    if (operations_array == NULL) {
+        perror("malloc");
         return 1;
     }
     
-    // настройка обработчиков сигналов
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
+    current_expression = full_line->head;
+    int current_op_index = 0;
+    while (current_expression != NULL) {
+        if (current_expression->type == EXPR_TYPE_COMMAND) {
+            operations_array[current_op_index++] = current_expression->cmd;
+        }
+        current_expression = current_expression->next;
+    }
+
+    int pipe_descriptors[2][2]; 
+    pid_t *child_pids = malloc(sizeof(pid_t) * operation_counter);
+    if (child_pids == NULL) {
+        perror("malloc");
+        free(operations_array);
+        return 1;
+    }
+
+    for (int i = 0; i < operation_counter; i++) {
+        if (i < operation_counter - 1) {
+            if (pipe(pipe_descriptors[i % 2]) < 0) {
+                perror("pipe");
+                for (int j = 0; j < i; j++) {
+                    kill(child_pids[j], SIGTERM);
+                }
+                free(child_pids);
+                free(operations_array);
+                return 1;
+            }
+        }
+
+        child_pids[i] = fork();
+        if (child_pids[i] < 0) {
+            for (int j = 0; j < i; j++) {
+                kill(child_pids[j], SIGTERM);
+            }
+            if (i < operation_counter - 1) {
+                close(pipe_descriptors[i % 2][0]);
+                close(pipe_descriptors[i % 2][1]);
+            }
+            free(child_pids);
+            free(operations_array);
+            return 1;
+        }
+
+        if (child_pids[i] == 0) {
+            if (i > 0) {
+                dup2(pipe_descriptors[(i + 1) % 2][0], STDIN_FILENO);
+            }
+            if (i < operation_counter - 1) {
+                dup2(pipe_descriptors[i % 2][1], STDOUT_FILENO);
+            } else if (full_line->out_type != OUTPUT_TYPE_STDOUT) {
+                int file_descriptor;
+                if (full_line->out_type == OUTPUT_TYPE_FILE_NEW) {
+                    file_descriptor = open(full_line->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                } else {
+                    file_descriptor = open(full_line->out_file, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                }
+                if (file_descriptor < 0) {
+                    exit(1);
+                }
+                dup2(file_descriptor, STDOUT_FILENO);
+                close(file_descriptor);
+            }
+
+            if (i < operation_counter - 1) {
+                close(pipe_descriptors[i % 2][0]);
+                close(pipe_descriptors[i % 2][1]);
+            }
+            if (i > 0) {
+                close(pipe_descriptors[(i + 1) % 2][0]);
+                close(pipe_descriptors[(i + 1) % 2][1]);
+            }
+
+            if (strcmp(operations_array[i].exe, "exit") == 0) {
+                int termination_code = 0;
+                if (operations_array[i].arg_count > 0)
+                    termination_code = atoi(operations_array[i].args[0]);
+                if (i < operation_counter - 1) {
+                    close(STDOUT_FILENO);
+                }
+                exit(termination_code);
+            }
+
+            if (strcmp(operations_array[i].exe, "cd") == 0) {
+                const char *directory_path = ".";
+                if (operations_array[i].arg_count > 0)
+                    directory_path = operations_array[i].args[0];
+                if (chdir(directory_path) != 0) {
+                    exit(1);
+                }
+                exit(0);
+            }
+
+            char **process_arguments = malloc(sizeof(char *) * (operations_array[i].arg_count + 2));
+            if (process_arguments == NULL) {
+                exit(1);
+            }
+            process_arguments[0] = operations_array[i].exe;
+            for (uint32_t j = 0; j < operations_array[i].arg_count; j++) {
+                process_arguments[j + 1] = operations_array[i].args[j];
+            }
+            process_arguments[operations_array[i].arg_count + 1] = NULL;
+
+            int discard_output = open("/dev/null", O_WRONLY);
+            if (discard_output != -1) {
+                dup2(discard_output, STDERR_FILENO);
+                close(discard_output);
+            }
+
+            execvp(operations_array[i].exe, process_arguments);
+            free(process_arguments);
+            exit(1);
+        }
+
+        if (i > 0) {
+            close(pipe_descriptors[(i + 1) % 2][0]);
+            close(pipe_descriptors[(i + 1) % 2][1]);
+        }
+    }
+
+    int final_status = 0;
+    int exit_op_index = -1;
+    for (int i = 0; i < operation_counter; i++) {
+        if (strcmp(operations_array[i].exe, "exit") == 0) {
+            exit_op_index = i;
+        }
+    }
+    for (int i = 0; i < operation_counter; i++) {
+        int individual_op_status;
+        waitpid(child_pids[i], &individual_op_status, 0);
+        if (i == exit_op_index) {
+            final_status = WEXITSTATUS(individual_op_status);
+        }
+        else if (exit_op_index == -1 && i == operation_counter - 1) {
+            final_status = WEXITSTATUS(individual_op_status);
+        }
+    }
+    if (exit_op_index != -1) {
+        int command_exit_code = 0;
+        if (operations_array[exit_op_index].arg_count > 0) {
+            command_exit_code = atoi(operations_array[exit_op_index].args[0]);
+        }
+        final_status = command_exit_code;
+    }
+    free(child_pids);
+    free(operations_array);
+    return final_status;
+}
+
+static bool
+involves_pipeline(const struct command_line *full_line)
+{
+    assert(full_line != NULL);
     
-    // перенаправление stderr в /dev/null для предотвращения показа приглашений
-    int dev_null = open("/dev/null", O_WRONLY);
-    if (dev_null != -1) {
-        dup2(dev_null, STDERR_FILENO);
-        close(dev_null);
+    struct expr *current_expr_node = full_line->head;
+    while (current_expr_node != NULL && current_expr_node->next != NULL) {
+        if (current_expr_node->next->type == EXPR_TYPE_PIPE) {
+            return true;
+        }
+        current_expr_node = current_expr_node->next;
     }
     
-    char input[MAX_INPUT_SIZE];
+    return false;
+}
+
+static int
+handle_operation_queue(const struct command_line *full_line)
+{
+    assert(full_line != NULL);
     
-    while (fgets(input, sizeof(input), stdin)) {
-        // обработка ввода
-        size_t len = strlen(input);
-        if (len > 0 && input[len - 1] == '\n') {
-            input[len - 1] = '\0';
+    if (full_line->head->type == EXPR_TYPE_COMMAND && 
+        strcmp(full_line->head->cmd.exe, "exit") == 0 && 
+        full_line->head->next == NULL) {
+        
+        int termination_code_val = 0;
+        if (full_line->head->cmd.arg_count > 0)
+            termination_code_val = atoi(full_line->head->cmd.args[0]);
+        exit(termination_code_val);
+    }
+    
+    if (full_line->head->type == EXPR_TYPE_COMMAND && 
+        strcmp(full_line->head->cmd.exe, "cd") == 0 && 
+        full_line->head->next == NULL && 
+        full_line->out_type == OUTPUT_TYPE_STDOUT) {
+        
+        return process_single_operation(&full_line->head->cmd);
+    }
+    
+    if (involves_pipeline(full_line)) {
+        return process_pipeline_operations(full_line);
+    }
+    
+    if (full_line->out_type != OUTPUT_TYPE_STDOUT) {
+        pid_t new_child_id = fork();
+        
+        if (new_child_id < 0) {
+            return 1;
         }
         
-        // пропуск пустых строк
-        if (strlen(input) == 0) {
-            continue;
+        if (new_child_id == 0) {
+            int discard_stream = open("/dev/null", O_WRONLY);
+            if (discard_stream != -1) {
+                dup2(discard_stream, STDERR_FILENO);
+                close(discard_stream);
+            }
+            
+            int target_fd;
+            if (full_line->out_type == OUTPUT_TYPE_FILE_NEW) {
+                target_fd = open(full_line->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            } else {
+                target_fd = open(full_line->out_file, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            }
+            
+            if (target_fd < 0) {
+                exit(1);
+            }
+            
+            dup2(target_fd, STDOUT_FILENO);
+            close(target_fd);
+            
+            int command_status = process_single_operation(&full_line->head->cmd);
+            
+            exit(command_status);
+        } else {
+            int parent_status;
+            waitpid(new_child_id, &parent_status, 0);
+            return WEXITSTATUS(parent_status);
         }
-        
-        // передача ввода парсеру
-        parser_feed(parser, input, strlen(input));
-        parser_feed(parser, "\n", 1);
-        
-        struct command_line *line;
-        enum parser_error err;
-        
-        while ((err = parser_pop_next(parser, &line)) == PARSER_ERR_NONE && line) {
-            execute_command_line(line, parser);
-            command_line_delete(line);
+    }
+    
+    return process_single_operation(&full_line->head->cmd);
+}
+
+int
+main(void)
+{
+    char input_buffer[4096];
+    ssize_t bytes_received;
+    
+    struct parser *line_parser = parser_new();
+    if (line_parser == NULL) {
+        perror("parser_new");
+        return 1;
+    }
+    
+    bool is_interactive_session = isatty(STDIN_FILENO);
+    
+    int final_exit_status = 0;
+    
+    while (1) {
+        if (is_interactive_session) {
+            printf("> ");
             fflush(stdout);
         }
+        
+        bytes_received = read(STDIN_FILENO, input_buffer, sizeof(input_buffer));
+        
+        if (bytes_received <= 0) {
+            if (bytes_received == 0 || errno == EINTR) {
+                break;
+            }
+            break;
+        }
+        
+        parser_feed(line_parser, input_buffer, bytes_received);
+        
+        struct command_line *current_task_line = NULL;
+        while (1) {
+            enum parser_error parse_err = parser_pop_next(line_parser, &current_task_line);
+            if (parse_err == PARSER_ERR_NONE && current_task_line == NULL)
+                break;
+            
+            if (parse_err != PARSER_ERR_NONE) {
+                break;
+            }
+            
+            final_exit_status = handle_operation_queue(current_task_line);
+            
+            command_line_delete(current_task_line);
+            current_task_line = NULL;
+        }
     }
     
-    parser_delete(parser);
-    return 0;
+    parser_delete(line_parser);
+    
+    return final_exit_status;
 }
