@@ -447,6 +447,20 @@ ufs_close(int fd)
 	/* Free file descriptor and clear the slot */
 	free(fdesc);
 	file_descriptors[fd] = NULL;
+
+	/* If this was the last reference to a deleted file, free it */
+	if (file->refs == 0 && file->prev == NULL && file->next == NULL && file_list != file) {
+		/* File was deleted but had open descriptors - now free it */
+		struct block *block = file->block_list;
+		while (block != NULL) {
+			struct block *next = block->next;
+			free(block->memory);
+			free(block);
+			block = next;
+		}
+		free(file->name);
+		free(file);
+	}
 	
 	return 0;
 }
