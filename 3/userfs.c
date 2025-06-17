@@ -5,7 +5,7 @@
 
 enum {
 	BLOCK_SIZE = 512,
-	MAX_FILE_SIZE = 1024 * 1024 * 100,
+	MAX_FILE_SIZE = 1024 * 1024,
 };
 
 /** Global error code. Set from any function on any error. */
@@ -42,6 +42,8 @@ struct file {
 	
 	/** Total size of the file. */
 	size_t size;
+	/** Flag indicating if the file has been deleted. */
+	int deleted;
 };
 
 /** List of all files. */
@@ -120,6 +122,7 @@ ufs_open(const char *filename, int flags)
 		file->last_block = NULL;
 		file->size = 0;
 		file->refs = 0;
+		file->deleted = 0;
 		
 		/* Add to file list */
 		file->next = file_list;
@@ -449,7 +452,7 @@ ufs_close(int fd)
 	file_descriptors[fd] = NULL;
 
 	/* If this was the last reference to a deleted file, free it */
-	if (file->refs == 0 && file->prev == NULL && file->next == NULL && file_list != file) {
+	if (file->refs == 0 && file->deleted) {
 		/* File was deleted but had open descriptors - now free it */
 		struct block *block = file->block_list;
 		while (block != NULL) {
@@ -496,7 +499,10 @@ ufs_delete(const char *filename)
 		file->next->prev = file->prev;
 	}
 	
-	/* If there are open descriptors, just unlink but don't free yet */
+	/* Mark file as deleted */
+	file->deleted = 1;
+	
+	/* If there are open descriptors, just mark as deleted but don't free yet */
 	if (file->refs > 0) {
 		return 0;
 	}
