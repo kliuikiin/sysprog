@@ -1,6 +1,5 @@
 #include "parser.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,413 +9,502 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include <limits.h>
+#include <stdbool.h>
+
+#define EXIT_SHELL_CODE 256
 
 static int process_single_operation(struct command *task);
 static int process_pipeline_operations(const struct command_line *full_line);
-static bool involves_pipeline(const struct command_line *full_line);
-static bool operation_present(const char *op_name);
+static bool involves_pipeline(const struct command_line *l);
+static int execute_job(const struct command_line *job_line, bool background);
 static int handle_operation_queue(const struct command_line *full_line);
 
-static bool
-operation_present(const char *op_name)
-{
-    if (strchr(op_name, '/') != NULL) {
-        return access(op_name, X_OK) == 0;
-    }
-    
+static bool operation_present(const char *op_name) {
+    if (strchr(op_name, '/') != NULL) return access(op_name, X_OK) == 0;
     const char *sys_path = getenv("PATH");
-    if (sys_path == NULL) {
-        return false;
+    if (!sys_path) return false;
+    char *path_copy = strdup(sys_path);
+    if (!path_copy) return false;
+    bool found = false;
+    char *saveptr;
+    char *dir = strtok_r(path_copy, ":", &saveptr);
+    while (dir) {
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", dir, op_name);
+        if (access(full, X_OK) == 0) { found = true; break; }
+        dir = strtok_r(NULL, ":", &saveptr);
     }
-    
-    char *path_copy_val = strdup(sys_path);
-    if (path_copy_val == NULL) {
-        return false;
-    }
-    
-    bool found_op = false;
-    char *folder_entry = strtok(path_copy_val, ":");
-    
-    while (folder_entry != NULL) {
-        char complete_path[4096];
-        snprintf(complete_path, sizeof(complete_path), "%s/%s", folder_entry, op_name);
-        
-        if (access(complete_path, X_OK) == 0) {
-            found_op = true;
-            break;
-        }
-        
-        folder_entry = strtok(NULL, ":");
-    }
-    
-    free(path_copy_val);
-    return found_op;
+    free(path_copy);
+    return found;
 }
 
-static int
-process_single_operation(struct command *task)
-{
+static int process_single_operation(struct command *task) {    
     if (strcmp(task->exe, "cd") == 0) {
-        const char *target_path = ".";
-        if (task->arg_count > 0)
-            target_path = task->args[0];
-        
-        if (chdir(target_path) != 0) {
+        const char *target = (task->arg_count > 0) ? task->args[0] : ".";
+        if (chdir(target) != 0) {
+            perror("cd");
             return 1;
         }
         return 0;
-    } 
-    
+    }
+
     if (strcmp(task->exe, "exit") == 0) {
-        int exit_code_val = 0;
-        if (task->arg_count > 0)
-            exit_code_val = atoi(task->args[0]);
-        exit(exit_code_val);
+        int code = (task->arg_count > 0) ? atoi(task->args[0]) : 0;
+        return EXIT_SHELL_CODE + code;
     }
     
     if (!operation_present(task->exe)) {
+        fprintf(stderr, "%s: command not found\n", task->exe);
+        return 127;
+    }
+    
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
         return 1;
     }
     
-    pid_t child_process_id = fork();
-    
-    if (child_process_id < 0) {
-        return 1;
+    if (pid == 0) {
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd != -1) {
+            dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
+        
+        char **argv = malloc(sizeof(char*) * (task->arg_count + 2));
+        if (!argv) _exit(1);
+        argv[0] = task->exe;
+        for (uint32_t i = 0; i < task->arg_count; ++i) {
+            argv[i+1] = task->args[i];
+        }
+        argv[task->arg_count+1] = NULL;
+        
+        execvp(task->exe, argv);
+        free(argv);
+        _exit(1);
     }
     
-    if (child_process_id == 0) {
-        int null_device = open("/dev/null", O_WRONLY);
-        if (null_device != -1) {
-            dup2(null_device, STDERR_FILENO);
-            close(null_device);
-        }
-        
-        char **arguments = malloc(sizeof(char *) * (task->arg_count + 2));
-        if (arguments == NULL) {
-            exit(1);
-        }
-        
-        arguments[0] = task->exe;
-        for (uint32_t i = 0; i < task->arg_count; i++) {
-            arguments[i + 1] = task->args[i];
-        }
-        arguments[task->arg_count + 1] = NULL;
-        
-        execvp(task->exe, arguments);
-        free(arguments);
-        exit(1);
-    } else {
-        int op_status;
-        waitpid(child_process_id, &op_status, 0);
-        return WEXITSTATUS(op_status);
-    }
+    int status;
+    waitpid(pid, &status, 0);
+    return (WIFEXITED(status)) ? WEXITSTATUS(status) : 1;
 }
 
-static int
-process_pipeline_operations(const struct command_line *full_line)
-{
-    int operation_counter = 0;
-    struct expr *current_expression = full_line->head;
-    while (current_expression != NULL) {
-        if (current_expression->type == EXPR_TYPE_COMMAND)
-            operation_counter++;
-        current_expression = current_expression->next;
-    }
-    
-    if (operation_counter == 0)
-        return 0;
-    
-    struct command *operations_array = malloc(sizeof(struct command) * operation_counter);
-    if (operations_array == NULL) {
+static int process_pipeline_operations(const struct command_line *full_line) {
+    int count = 0;
+    for (struct expr *e = full_line->head; e; e = e->next) {
+        if (e->type == EXPR_TYPE_COMMAND) count++;
+    }   
+    if (count == 0) return 0;
+
+    pid_t *pids = malloc(sizeof(pid_t) * count);
+    if (!pids) {
         perror("malloc");
         return 1;
     }
+
+    struct command *commands = malloc(sizeof(struct command) * count);
+    if (!commands) {
+        perror("malloc");
+        free(pids);
+        return 1;
+    }
     
-    current_expression = full_line->head;
-    int current_op_index = 0;
-    while (current_expression != NULL) {
-        if (current_expression->type == EXPR_TYPE_COMMAND) {
-            operations_array[current_op_index++] = current_expression->cmd;
+    int idx = 0;
+    for (struct expr *e = full_line->head; e; e = e->next) {
+        if (e->type == EXPR_TYPE_COMMAND) {
+            commands[idx++] = e->cmd;
         }
-        current_expression = current_expression->next;
     }
 
-    int pipe_descriptors[2][2]; 
-    pid_t *child_pids = malloc(sizeof(pid_t) * operation_counter);
-    if (child_pids == NULL) {
-        perror("malloc");
-        free(operations_array);
-        return 1;
-    }
-
-    for (int i = 0; i < operation_counter; i++) {
-        if (i < operation_counter - 1) {
-            if (pipe(pipe_descriptors[i % 2]) < 0) {
+    int pipefd[2] = {-1, -1};
+    int in_fd = STDIN_FILENO;
+    
+    for (int i = 0; i < count; i++) {
+        if (i < count - 1) {
+            if (pipe(pipefd) < 0) {
                 perror("pipe");
-                for (int j = 0; j < i; j++) {
-                    kill(child_pids[j], SIGTERM);
-                }
-                free(child_pids);
-                free(operations_array);
+                for (int j = 0; j < i; j++) kill(pids[j], SIGTERM);
+                free(pids);
+                free(commands);
                 return 1;
             }
         }
 
-        child_pids[i] = fork();
-        if (child_pids[i] < 0) {
-            for (int j = 0; j < i; j++) {
-                kill(child_pids[j], SIGTERM);
+        pids[i] = fork();
+        if (pids[i] < 0) {
+            for (int j = 0; j < i; j++) kill(pids[j], SIGTERM);
+            if (i < count - 1) {
+                close(pipefd[0]);
+                close(pipefd[1]);
             }
-            if (i < operation_counter - 1) {
-                close(pipe_descriptors[i % 2][0]);
-                close(pipe_descriptors[i % 2][1]);
-            }
-            free(child_pids);
-            free(operations_array);
+            free(pids);
+            free(commands);
             return 1;
         }
 
-        if (child_pids[i] == 0) {
-            if (i > 0) {
-                dup2(pipe_descriptors[(i + 1) % 2][0], STDIN_FILENO);
+        if (pids[i] == 0) {
+            int null_fd = open("/dev/null", O_WRONLY);
+            if (null_fd != -1) {
+                dup2(null_fd, STDERR_FILENO);
+                close(null_fd);
             }
-            if (i < operation_counter - 1) {
-                dup2(pipe_descriptors[i % 2][1], STDOUT_FILENO);
+            
+            if (i > 0) {
+                dup2(in_fd, STDIN_FILENO);
+            }
+            
+            if (i < count - 1) {
+                dup2(pipefd[1], STDOUT_FILENO);
             } else if (full_line->out_type != OUTPUT_TYPE_STDOUT) {
-                int file_descriptor;
-                if (full_line->out_type == OUTPUT_TYPE_FILE_NEW) {
-                    file_descriptor = open(full_line->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                } else {
-                    file_descriptor = open(full_line->out_file, O_WRONLY | O_CREAT | O_APPEND, 0666);
-                }
-                if (file_descriptor < 0) {
-                    exit(1);
-                }
-                dup2(file_descriptor, STDOUT_FILENO);
-                close(file_descriptor);
+                int flags = (full_line->out_type == OUTPUT_TYPE_FILE_NEW) ? 
+                    (O_WRONLY | O_CREAT | O_TRUNC) : 
+                    (O_WRONLY | O_CREAT | O_APPEND);
+                int fd = open(full_line->out_file, flags, 0666);
+                if (fd < 0) _exit(1);
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
             }
-
-            if (i < operation_counter - 1) {
-                close(pipe_descriptors[i % 2][0]);
-                close(pipe_descriptors[i % 2][1]);
+            
+            if (i < count - 1) {
+                close(pipefd[0]);
+                close(pipefd[1]);
             }
             if (i > 0) {
-                close(pipe_descriptors[(i + 1) % 2][0]);
-                close(pipe_descriptors[(i + 1) % 2][1]);
+                close(in_fd);
             }
-
-            if (strcmp(operations_array[i].exe, "exit") == 0) {
-                int termination_code = 0;
-                if (operations_array[i].arg_count > 0)
-                    termination_code = atoi(operations_array[i].args[0]);
-                if (i < operation_counter - 1) {
-                    close(STDOUT_FILENO);
-                }
-                exit(termination_code);
+            
+            if (strcmp(commands[i].exe, "exit") == 0) {
+                int code = (commands[i].arg_count > 0) ? atoi(commands[i].args[0]) : 0;
+                _exit(code);
             }
-
-            if (strcmp(operations_array[i].exe, "cd") == 0) {
-                const char *directory_path = ".";
-                if (operations_array[i].arg_count > 0)
-                    directory_path = operations_array[i].args[0];
-                if (chdir(directory_path) != 0) {
-                    exit(1);
-                }
-                exit(0);
+            
+            char **argv = malloc(sizeof(char*) * (commands[i].arg_count + 2));
+            if (!argv) _exit(1);
+            argv[0] = commands[i].exe;
+            for (uint32_t j = 0; j < commands[i].arg_count; ++j) {
+                argv[j+1] = commands[i].args[j];
             }
-
-            char **process_arguments = malloc(sizeof(char *) * (operations_array[i].arg_count + 2));
-            if (process_arguments == NULL) {
-                exit(1);
-            }
-            process_arguments[0] = operations_array[i].exe;
-            for (uint32_t j = 0; j < operations_array[i].arg_count; j++) {
-                process_arguments[j + 1] = operations_array[i].args[j];
-            }
-            process_arguments[operations_array[i].arg_count + 1] = NULL;
-
-            int discard_output = open("/dev/null", O_WRONLY);
-            if (discard_output != -1) {
-                dup2(discard_output, STDERR_FILENO);
-                close(discard_output);
-            }
-
-            execvp(operations_array[i].exe, process_arguments);
-            free(process_arguments);
-            exit(1);
+            argv[commands[i].arg_count+1] = NULL;
+            
+            execvp(commands[i].exe, argv);
+            free(argv);
+            _exit(1);
         }
-
+        
         if (i > 0) {
-            close(pipe_descriptors[(i + 1) % 2][0]);
-            close(pipe_descriptors[(i + 1) % 2][1]);
+            close(in_fd);
         }
+        
+        if (i < count - 1) {
+            close(pipefd[1]);
+            in_fd = pipefd[0];
+        }
+    }
+
+    if (in_fd != STDIN_FILENO) {
+        close(in_fd);
     }
 
     int final_status = 0;
-    int exit_op_index = -1;
-    for (int i = 0; i < operation_counter; i++) {
-        if (strcmp(operations_array[i].exe, "exit") == 0) {
-            exit_op_index = i;
+    int last_exit_index = -1;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(commands[i].exe, "exit") == 0) {
+            last_exit_index = i;
         }
     }
-    for (int i = 0; i < operation_counter; i++) {
-        int individual_op_status;
-        waitpid(child_pids[i], &individual_op_status, 0);
-        if (i == exit_op_index) {
-            final_status = WEXITSTATUS(individual_op_status);
-        }
-        else if (exit_op_index == -1 && i == operation_counter - 1) {
-            final_status = WEXITSTATUS(individual_op_status);
+    
+    for (int i = 0; i < count; ++i) {
+        int st;
+        waitpid(pids[i], &st, 0);
+        if (last_exit_index == -1 && i == count - 1) {
+            final_status = WEXITSTATUS(st);
         }
     }
-    if (exit_op_index != -1) {
-        int command_exit_code = 0;
-        if (operations_array[exit_op_index].arg_count > 0) {
-            command_exit_code = atoi(operations_array[exit_op_index].args[0]);
-        }
-        final_status = command_exit_code;
+    
+    if (last_exit_index != -1) {
+        final_status = (commands[last_exit_index].arg_count > 0) ? 
+            atoi(commands[last_exit_index].args[0]) : 0;
     }
-    free(child_pids);
-    free(operations_array);
+    
+    free(pids);
+    free(commands);
     return final_status;
 }
 
-static bool
-involves_pipeline(const struct command_line *full_line)
-{
-    assert(full_line != NULL);
-    
-    struct expr *current_expr_node = full_line->head;
-    while (current_expr_node != NULL && current_expr_node->next != NULL) {
-        if (current_expr_node->next->type == EXPR_TYPE_PIPE) {
+static bool involves_pipeline(const struct command_line *l) {
+    if (!l || !l->head) return false;
+    struct expr *current = l->head;
+    while (current) {
+        if (current->type == EXPR_TYPE_PIPE) {
             return true;
         }
-        current_expr_node = current_expr_node->next;
+        current = current->next;
     }
-    
     return false;
 }
 
-static int
-handle_operation_queue(const struct command_line *full_line)
-{
-    assert(full_line != NULL);
+static int execute_job(const struct command_line *job_line, bool background) {
+    if (!job_line->head) return 0;
     
-    if (full_line->head->type == EXPR_TYPE_COMMAND && 
-        strcmp(full_line->head->cmd.exe, "exit") == 0 && 
-        full_line->head->next == NULL) {
-        
-        int termination_code_val = 0;
-        if (full_line->head->cmd.arg_count > 0)
-            termination_code_val = atoi(full_line->head->cmd.args[0]);
-        exit(termination_code_val);
+    if (involves_pipeline(job_line)) {
+        return process_pipeline_operations(job_line);
     }
     
-    if (full_line->head->type == EXPR_TYPE_COMMAND && 
-        strcmp(full_line->head->cmd.exe, "cd") == 0 && 
-        full_line->head->next == NULL && 
-        full_line->out_type == OUTPUT_TYPE_STDOUT) {
-        
-        return process_single_operation(&full_line->head->cmd);
-    }
-    
-    if (involves_pipeline(full_line)) {
-        return process_pipeline_operations(full_line);
-    }
-    
-    if (full_line->out_type != OUTPUT_TYPE_STDOUT) {
-        pid_t new_child_id = fork();
-        
-        if (new_child_id < 0) {
+    if (job_line->out_type != OUTPUT_TYPE_STDOUT) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
             return 1;
         }
         
-        if (new_child_id == 0) {
-            int discard_stream = open("/dev/null", O_WRONLY);
-            if (discard_stream != -1) {
-                dup2(discard_stream, STDERR_FILENO);
-                close(discard_stream);
+        if (pid == 0) {
+            int null_fd = open("/dev/null", O_WRONLY);
+            if (null_fd != -1) {
+                dup2(null_fd, STDERR_FILENO);
+                close(null_fd);
             }
             
-            int target_fd;
-            if (full_line->out_type == OUTPUT_TYPE_FILE_NEW) {
-                target_fd = open(full_line->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            } else {
-                target_fd = open(full_line->out_file, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            int flags = (job_line->out_type == OUTPUT_TYPE_FILE_NEW) ? 
+                (O_WRONLY | O_CREAT | O_TRUNC) : 
+                (O_WRONLY | O_CREAT | O_APPEND);
+            
+            int fd = open(job_line->out_file, flags, 0666);
+            if (fd < 0) _exit(1);
+            
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+            
+            int st = process_single_operation(&job_line->head->cmd);
+            if (st >= EXIT_SHELL_CODE) {
+                _exit(st - EXIT_SHELL_CODE);
             }
-            
-            if (target_fd < 0) {
-                exit(1);
-            }
-            
-            dup2(target_fd, STDOUT_FILENO);
-            close(target_fd);
-            
-            int command_status = process_single_operation(&full_line->head->cmd);
-            
-            exit(command_status);
+            _exit(st);
+        }
+        
+        if (background) {
+            return 0;
         } else {
-            int parent_status;
-            waitpid(new_child_id, &parent_status, 0);
-            return WEXITSTATUS(parent_status);
+            int status;
+            waitpid(pid, &status, 0);
+            return WEXITSTATUS(status);
         }
     }
+
+    if (background) {
+        pid_t bg_pid = fork();
+        if (bg_pid < 0) {
+            perror("fork");
+            return 1;
+        }
+        
+        if (bg_pid == 0) {
+            int null_fd = open("/dev/null", O_WRONLY);
+            if (null_fd != -1) {
+                dup2(null_fd, STDERR_FILENO);
+                close(null_fd);
+            }
+            
+            int status = process_single_operation(&job_line->head->cmd);
+            if (status >= EXIT_SHELL_CODE) {
+                exit(status - EXIT_SHELL_CODE);
+            }
+            exit(status);
+        }
+        return 0;
+    }
     
-    return process_single_operation(&full_line->head->cmd);
+    return process_single_operation(&job_line->head->cmd);
 }
 
-int
-main(void)
-{
-    char input_buffer[4096];
-    ssize_t bytes_received;
+static int handle_operation_queue(const struct command_line *full_line) {
+    if (!full_line || !full_line->head) {
+        return 0;
+    }
+
+    bool background = false;
+    struct expr *current = full_line->head;
+    struct expr *prev = NULL;
+    struct expr *last_cmd = NULL;
     
-    struct parser *line_parser = parser_new();
-    if (line_parser == NULL) {
+    while (current) {
+        if (current->type == EXPR_TYPE_COMMAND) {
+            last_cmd = current;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    if (last_cmd && strcmp(last_cmd->cmd.exe, "&") == 0 && last_cmd->cmd.arg_count == 0) {
+        background = true;
+        
+        if (prev && prev != last_cmd) {
+            struct expr *p = full_line->head;
+            while (p && p->next != last_cmd) p = p->next;
+            if (p) {
+                p->next = NULL;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    if (background) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return 1;
+        }
+        
+        if (pid == 0) {
+            int null_fd = open("/dev/null", O_WRONLY);
+            if (null_fd != -1) {
+                dup2(null_fd, STDERR_FILENO);
+                close(null_fd);
+            }
+            
+            setsid();
+            int status = handle_operation_queue(full_line);
+            exit(status);
+        }
+        return 0;
+    }
+
+    int last_status = 0;
+    bool should_run_next = true;
+    current = full_line->head;
+
+    while (current) {
+        struct expr *job_start = current;
+        struct expr *job_end = current;
+        
+        while (job_end) {
+            if (job_end->type == EXPR_TYPE_AND || job_end->type == EXPR_TYPE_OR) {
+                break;
+            }
+            job_end = job_end->next;
+        }
+
+        struct command_line job_line = *full_line;
+        job_line.head = job_start;
+        bool is_last_job = (job_end == NULL);
+        job_line.out_type = is_last_job ? full_line->out_type : OUTPUT_TYPE_STDOUT;
+        job_line.out_file = is_last_job ? full_line->out_file : NULL;
+
+        struct expr *saved_next = NULL;
+        if (job_end) {
+            saved_next = job_end->next;
+            job_end->next = NULL;
+        }
+
+        int job_status = 0;
+        if (should_run_next) {
+            job_status = execute_job(&job_line, background);
+        }
+
+        if (job_status >= EXIT_SHELL_CODE) {
+            if (job_end) {
+                job_end->next = saved_next;
+            }
+            return job_status;
+        }
+
+        if (job_end) {
+            job_end->next = saved_next;
+            enum expr_type op = job_end->type;
+            last_status = job_status;
+            
+            if (op == EXPR_TYPE_AND) {
+                should_run_next = (last_status == 0);
+            } else if (op == EXPR_TYPE_OR) {
+                should_run_next = (last_status != 0);
+            }
+            current = job_end->next;
+        } else {
+            last_status = job_status;
+            current = NULL;
+        }
+    }
+
+    return last_status;
+}
+
+void sigchld_handler(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+}
+
+int main() {
+    signal(SIGCHLD, sigchld_handler);
+    signal(SIGINT, SIG_IGN);
+
+    struct parser *parser = parser_new();
+    if (!parser) {
         perror("parser_new");
         return 1;
     }
     
-    bool is_interactive_session = isatty(STDIN_FILENO);
-    
-    int final_exit_status = 0;
+    bool interactive = isatty(STDIN_FILENO);
+    char buf[4096];
+    int exit_status = 0;
     
     while (1) {
-        if (is_interactive_session) {
+        int child_status;
+        while (waitpid(-1, &child_status, WNOHANG) > 0);
+
+        if (interactive) {
             printf("> ");
             fflush(stdout);
         }
         
-        bytes_received = read(STDIN_FILENO, input_buffer, sizeof(input_buffer));
+        ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+        if (r < 0) { 
+            if (errno == EINTR) continue; 
+            perror("read"); 
+            break; 
+        }
         
-        if (bytes_received <= 0) {
-            if (bytes_received == 0 || errno == EINTR) {
-                break;
+        if (r == 0) {
+            if (interactive) printf("\n");
+            parser_feed(parser, "\n", 1);
+            struct command_line *cl2 = NULL;
+            while (parser_pop_next(parser, &cl2) == PARSER_ERR_NONE && cl2) {
+                exit_status = handle_operation_queue(cl2);
+                command_line_delete(cl2);
+                cl2 = NULL;
+                if (exit_status >= EXIT_SHELL_CODE) {
+                    exit_status -= EXIT_SHELL_CODE;
+                    parser_delete(parser);
+                    return exit_status;
+                }
             }
             break;
         }
         
-        parser_feed(line_parser, input_buffer, bytes_received);
-        
-        struct command_line *current_task_line = NULL;
+        parser_feed(parser, buf, r);
+        struct command_line *cl = NULL;
         while (1) {
-            enum parser_error parse_err = parser_pop_next(line_parser, &current_task_line);
-            if (parse_err == PARSER_ERR_NONE && current_task_line == NULL)
-                break;
-            
-            if (parse_err != PARSER_ERR_NONE) {
+            enum parser_error err = parser_pop_next(parser, &cl);
+            if (err == PARSER_ERR_NONE && !cl) {
                 break;
             }
             
-            final_exit_status = handle_operation_queue(current_task_line);
+            if (err != PARSER_ERR_NONE) { 
+                fprintf(stderr, "Parser error\n"); 
+                break; 
+            }
             
-            command_line_delete(current_task_line);
-            current_task_line = NULL;
+            exit_status = handle_operation_queue(cl);
+            command_line_delete(cl);
+            cl = NULL;
+            
+            if (exit_status >= EXIT_SHELL_CODE) {
+                exit_status -= EXIT_SHELL_CODE;
+                parser_delete(parser);
+                return exit_status;
+            }
         }
     }
     
-    parser_delete(line_parser);
-    
-    return final_exit_status;
+    parser_delete(parser);
+    return exit_status;
 }
