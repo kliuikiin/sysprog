@@ -297,13 +297,6 @@ static void
 chat_server_broadcast_message(struct chat_server *server, struct chat_message *message, 
 							  struct chat_peer *exclude_peer)
 {
-	// Count active peers (for debugging)
-	int active_peers = 0;
-	for (int i = 0; i < server->peer_count; i++) {
-		if (server->peers[i].is_active && &server->peers[i] != exclude_peer) {
-			active_peers++;
-		}
-	}
 	
 	for (int i = 0; i < server->peer_count; i++) {
 		struct chat_peer *peer = &server->peers[i];

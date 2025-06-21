@@ -18,7 +18,7 @@ test: lib
 # For automatic testing systems to be able to just build whatever was submitted
 # by a student.
 test_glob:
-	gcc $(GCC_FLAGS) *.c ../utils/unit.c -I ../utils -lpthread -o test
+	gcc $(GCC_FLAGS) *.c ../utils/unit.c -I ../utils -lpthread ../utils/heap_help/heap_help.c -I ../utils/heap_help -ldl -o test
 
 clean:
 	rm *.o
