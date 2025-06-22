@@ -554,15 +554,6 @@ void sigchld_handler(int sig) {
 
 int main() {
     DEBUG_PRINT("Shell starting (PID %d)\n", getpid());
-    
-    struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (sigaction(SIGCHLD, &sa, NULL) < 0) {
-        perror("sigaction");
-        return 1;
-    }
 
     signal(SIGINT, SIG_IGN);
 
