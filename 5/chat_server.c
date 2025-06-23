@@ -622,22 +622,6 @@ chat_server_update(struct chat_server *server, double timeout)
 	struct epoll_event events[MAX_PEERS];
 	int timeout_ms = timeout < 0 ? -1 : (int)(timeout * 1000);
 	
-	// Check if any peer has data to write and make sure EPOLLOUT is set
-	for (int i = 0; i < server->peer_count; i++) {
-		struct chat_peer *peer = &server->peers[i];
-		if (!peer->is_active)
-			continue;
-			
-		if (peer->output_buffer.used > peer->output_buffer.processed) {
-			// Add EPOLLOUT to the event to make sure we can write data
-			struct epoll_event event;
-			event.events = EPOLLIN | EPOLLOUT | EPOLLET;
-			event.data.ptr = peer;
-			// Note: we're using EPOLL_CTL_MOD which is less efficient but necessary here
-			epoll_ctl(server->io_descriptor, EPOLL_CTL_MOD, peer->socket, &event);
-		}
-	}
-	
 	int event_count = epoll_wait(server->io_descriptor, events, MAX_PEERS, timeout_ms);
 	if (event_count < 0) {
 		if (errno == EINTR) {
