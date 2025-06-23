@@ -255,10 +255,7 @@ chat_server_add_peer(struct chat_server *server, int socket)
 	struct epoll_event event;
 	event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 	event.data.ptr = peer;
-	if (epoll_ctl(server->io_descriptor, EPOLL_CTL_ADD, socket, &event) == -1) {
-		perror("epoll_ctl: add peer");
-		abort();
-	}
+	epoll_ctl(server->io_descriptor, EPOLL_CTL_ADD, peer->socket, &event);
 #elif defined(KQUEUE_MODE)
 	struct kevent events[2];
 	EV_SET(&events[0], socket, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, peer);
